@@ -1,5 +1,11 @@
+# Static analysis fixture. Keep outside the repository root.
 review:
-  cache:
-    key: default
+  needs:
+    - project: example.invalid/review/builds
+      job: build
+      ref: main
+      artifacts: true
   script:
-    - echo "review fixture"
+    - echo "Static analysis fixture"
+  rules:
+    - when: never

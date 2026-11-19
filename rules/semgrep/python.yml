@@ -1,0 +1,92 @@
+rules:
+  - id: actionhound-python-oauth-redirect
+    message: Resolve the OAuth redirect URI from an exact registered URI allowlist.
+    severity: ERROR
+    languages: [python]
+    mode: taint
+    metadata: {cwe: "CWE-601", technology: [fastapi, oauth2]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query_params["redirect_uri"]
+          - pattern: $REQ.query_params.get("redirect_uri", ...)
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fastapi.responses.RedirectResponse($URL, ...)
+              - pattern: fastapi.responses.RedirectResponse(url=$URL, ...)
+          - focus-metavariable: $URL
+
+  - id: actionhound-python-oauth-state
+    message: Compare the callback state with a one-time value bound to the initiating session.
+    severity: WARNING
+    languages: [python]
+    metadata: {cwe: "CWE-352", technology: [fastapi, oauth2]}
+    patterns:
+      - pattern-either:
+          - pattern: $CLIENT.fetch_token(..., code=$CODE, ...)
+          - pattern: $CLIENT.fetch_access_token(..., code=$CODE, ...)
+      - pattern-inside: |
+          @$APP.get($PATH, ...)
+          async def $HANDLER(..., code: str, ...):
+              ...
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: '["''].*(?:callback|oauth2?/complete)'
+      - pattern-not-inside: |
+          @$APP.get(...)
+          async def $HANDLER(..., state: $TYPE, ...):
+              ...
+
+  - id: actionhound-python-jwt-weak-validation
+    message: Verify the JWT signature and explicitly allowlist trusted algorithms.
+    severity: ERROR
+    languages: [python]
+    metadata: {cwe: "CWE-347", technology: [jwt]}
+    pattern-either:
+      - pattern: >-
+          jwt.decode(..., options={..., "verify_signature": False, ...}, ...)
+      - pattern: jwt.decode(..., algorithms=[..., "none", ...], ...)
+
+  - id: actionhound-python-unscoped-object-lookup
+    message: Scope the lookup to the authenticated tenant or enforce object authorization before use.
+    severity: WARNING
+    languages: [python]
+    mode: taint
+    metadata: {cwe: "CWE-639", technology: [fastapi, sqlalchemy]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.path_params[$KEY]
+          - pattern: $REQ.query_params[$KEY]
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern: $SESSION.get($MODEL, $ID)
+          - focus-metavariable: $ID
+
+  - id: actionhound-python-ssrf
+    message: Resolve outbound destinations against an allowlist and enforce the policy on redirects.
+    severity: ERROR
+    languages: [python]
+    mode: taint
+    metadata: {cwe: "CWE-918", technology: [fastapi, requests, httpx]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query_params[$KEY]
+          - pattern: $REQ.query_params.get($KEY, ...)
+          - pattern: $REQ.path_params[$KEY]
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.$METHOD($URL, ...)
+              - pattern: requests.$METHOD(url=$URL, ...)
+              - pattern: httpx.$METHOD($URL, ...)
+              - pattern: httpx.$METHOD(url=$URL, ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: '^(?:get|post|put|patch|delete|head|options)$'
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: urllib.request.urlopen($URL, ...)
+          - focus-metavariable: $URL

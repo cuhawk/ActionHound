@@ -1,32 +1,41 @@
+"""Command line interface for ActionHound."""
+
 import argparse
 import json
+import sys
 from pathlib import Path
 
-import yaml
+from .sarif import to_markdown, to_sarif
+from .scanner import ScanError, scan
 
-from .sarif import LEVELS, markdown, serialize
-from .scanner import scan
+SEVERITIES = ("low", "medium", "high", "critical")
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="actionhound")
-    sub = parser.add_subparsers(required=True)
-    command = sub.add_parser("scan")
-    command.add_argument("directory", type=Path)
-    command.add_argument("--sarif", type=Path)
-    command.add_argument("--trust-policy", type=Path, action="append", default=[])
-    command.add_argument("--fail-on", choices=LEVELS)
-    args = parser.parse_args()
-    if not args.directory.is_dir():
-        parser.error("scan directory does not exist")
+    commands = parser.add_subparsers(dest="command", required=True)
+    scan_parser = commands.add_parser("scan", help="Scan a CI/CD repository")
+    scan_parser.add_argument("directory", type=Path)
+    scan_parser.add_argument("--sarif", type=Path, help="Write a SARIF 2.1.0 report")
+    scan_parser.add_argument("--markdown", type=Path, help="Write a Markdown report")
+    scan_parser.add_argument("--trust-policy", type=Path, action="append", default=[],
+                             help="Scan an AWS IAM trust policy JSON file inside the repository")
+    scan_parser.add_argument("--fail-on", choices=SEVERITIES)
+    args = parser.parse_args(argv)
+
     try:
         findings = scan(args.directory, args.trust_policy)
+        summary = to_markdown(findings)
         if args.sarif:
-            args.sarif.write_text(json.dumps(serialize(findings), indent=2) + "\n")
-    except (ValueError, OSError, yaml.YAMLError) as exc:
-        parser.exit(2, f"actionhound: {exc}\n")
-    print(markdown(findings))
-    order = {"low": 1, "medium": 2, "high": 3}
-    return int(bool(args.fail_on and any(
-        order[item.severity] >= order[args.fail_on] for item in findings
-    )))
+            args.sarif.write_text(json.dumps(to_sarif(findings), indent=2) + "\n", encoding="utf-8")
+        if args.markdown:
+            args.markdown.write_text(summary, encoding="utf-8")
+        print(summary, end="")
+    except (ScanError, OSError) as exc:
+        print(f"actionhound: {exc}", file=sys.stderr)
+        return 2
+
+    return int(bool(args.fail_on) and any(
+        SEVERITIES.index(finding.rule.severity) >= SEVERITIES.index(args.fail_on)
+        for finding in findings
+    ))

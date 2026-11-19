@@ -1,162 +1,362 @@
-"""Static workflow diagnostics. Workflow commands are never executed."""
+"""Scan local YAML without running workflow code or resolving remote includes."""
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-EXPRESSION = re.compile(r"\$\{\{\s*github\.event(?:\.|\[)[^}]+\}\}")
-SHA = re.compile(r"[a-fA-F0-9]{40}\Z")
+
+@dataclass(frozen=True)
+class Rule:
+    severity: str
+    title: str
+    advice: str
+
+
+RULES = {
+    "AH001": Rule("critical", "Untrusted checkout in pull_request_target",
+                  "Use pull_request for untrusted code or check out only the trusted base."),
+    "AH002": Rule("high", "Untrusted expression in inline script",
+                  "Pass data through an environment variable and quote its shell expansion."),
+    "AH003": Rule("medium", "Action or reusable workflow is not SHA-pinned",
+                  "Pin the reference to a verified full commit SHA."),
+    "AH004": Rule("high", "All workflow permissions are writable",
+                  "Grant only the permissions the workflow or job needs."),
+    "AH005": Rule("high", "Secrets passed to a mutable external step",
+                  "Pin and review the action before granting access to individual secrets."),
+    "AH006": Rule("high", "Cache crosses a workflow trust boundary",
+                  "Separate caches by trust level and avoid writable shared caches."),
+    "AH007": Rule("high", "Cross-workflow artifact download",
+                  "Validate the producer and content before consuming artifacts in a privileged job."),
+    "AH008": Rule("high", "Wildcard OIDC trust subject",
+                  "Restrict federation to a specific repository, ref, or protected environment."),
+    "AH009": Rule("medium", "OIDC token permission lacks an explicit job boundary",
+                  "Grant id-token: write only to deployment jobs with a protected environment."),
+    "AH010": Rule("medium", "GitLab remote include has no immutable reference",
+                  "Pin project includes to a verified full commit SHA and remote includes by integrity."),
+    "AH012": Rule("medium", "GitLab cache key is shared across refs",
+                  "Use a ref-specific cache key and enforce separate trust domains."),
+    "AH013": Rule("high", "Secrets available after untrusted checkout",
+                  "Run trusted steps with secrets in a separate job that never checks out the PR head."),
+    "AH011": Rule("high", "Merge request job uses shell re-evaluation",
+                  "Treat merge request variables as data and avoid shell re-evaluation."),
+}
 
 
 @dataclass(frozen=True, order=True)
 class Finding:
     path: str
     line: int
-    rule: str
-    severity: str
-    message: str
+    column: int
+    rule_id: str
+
+    @property
+    def rule(self) -> Rule:
+        return RULES[self.rule_id]
 
 
-def scan_file(path: Path, root: Path):
-    text = path.read_text()
-    data = yaml.safe_load(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a YAML mapping")
-    location = path.relative_to(root).as_posix()
-    lines = text.splitlines()
-    results = set()
-
-    def emit(rule, severity, message, fragment):
-        line = next((i for i, text_line in enumerate(lines, 1)
-                     if fragment and fragment in text_line), 1)
-        results.add(Finding(location, line, rule, severity, message))
-
-    if path.name == ".gitlab-ci.yml":
-        for job in data.values():
-            if not isinstance(job, dict) or "script" not in job:
-                continue
-            for command in as_list(job["script"]):
-                command = str(command)
-                if re.search(r'\b(?:eval|(?:ba)?sh\s+-c)\s+["\']?\$\{?CI_MERGE_REQUEST_', command):
-                    emit("gitlab-script-input", "high",
-                         "Merge request metadata reaches a shell interpreter.", command)
-            cache = job.get("cache")
-            if isinstance(cache, dict) and cache.get("key") in {"default", "$CI_PROJECT_NAME"}:
-                emit("shared-cache", "medium", "Cache is shared across refs.", str(cache["key"]))
-        return sorted(results)
-
-    events = data.get("on", data.get(True, []))
-    privileged_pr = "pull_request_target" in (
-        events if isinstance(events, (list, dict)) else [events]
-    )
-    jobs = data.get("jobs", {})
-    if not isinstance(jobs, dict):
-        raise ValueError(f"{path}: jobs must be a mapping")
-
-    def permissions(value):
-        if value == "write-all":
-            emit("write-all", "high", "Grant only required token permissions.", "write-all")
-        if isinstance(value, dict) and value.get("id-token") == "write":
-            emit("oidc-token", "medium",
-                 "Review federated trust conditions for this OIDC-enabled job.", "id-token")
-
-    permissions(data.get("permissions"))
-    for job in jobs.values():
-        if not isinstance(job, dict):
-            continue
-        permissions(job.get("permissions"))
-        steps = [step for step in as_list(job.get("steps", [])) if isinstance(step, dict)]
-        steps = ([job] if "uses" in job else []) + steps
-        unsafe_checkout = False
-        for step in steps:
-            uses = step.get("uses", "")
-            if not isinstance(uses, str):
-                continue
-            action, _, ref = uses.partition("@")
-            if uses and not uses.startswith(("./", "docker://")) and not SHA.fullmatch(ref):
-                emit("mutable-action", "medium", "Pin the action to a full commit SHA.", uses)
-            if uses.startswith("docker://") and not re.search(r"@sha256:[a-fA-F0-9]{64}$", uses):
-                emit("mutable-image", "medium", "Pin the image to a SHA-256 digest.", uses)
-            options = step.get("with", {})
-            if not isinstance(options, dict):
-                options = {}
-            checkout_ref = str(options.get("ref", "")) + str(options.get("repository", ""))
-            if privileged_pr and action == "actions/checkout" and "github.event.pull_request.head" in checkout_ref:
-                unsafe_checkout = True
-                emit("privileged-pr-checkout", "high",
-                     "Privileged workflow checks out pull request head content.", uses)
-            if action.startswith("actions/cache") and (
-                privileged_pr or options.get("restore-keys")
-            ):
-                emit("cache-trust", "medium", "Review cache provenance across trust boundaries.", uses)
-            if action == "actions/download-artifact" and (
-                privileged_pr or events == "workflow_run" or (
-                    isinstance(events, (dict, list)) and "workflow_run" in events
-                )
-            ):
-                emit("artifact-trust", "medium", "Review artifact provenance before use.", uses)
-            command = step.get("run")
-            if isinstance(command, str) and (match := EXPRESSION.search(command)):
-                emit("script-expression", "high",
-                     "Move event metadata into environment variables and quote expansions.",
-                     match.group())
-            if unsafe_checkout and "secrets." in str(step):
-                emit("secret-after-checkout", "high",
-                     "Secret is available after an untrusted checkout.", "secrets.")
-    return sorted(results)
+class ScanError(ValueError):
+    """A source file could not be read or parsed."""
 
 
-def scan_oidc(path: Path, root: Path):
-    """Inspect standalone AWS trust policies kept alongside workflows."""
-    import json
+class WorkflowLoader(yaml.SafeLoader):
+    """Use YAML 1.2 boolean spellings so the workflow 'on' key stays a string."""
 
-    text = path.read_text()
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        return []
-    results = set()
-    for statement in as_list(data.get("Statement", [])):
-        if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
-            continue
-        principal = statement.get("Principal", {})
-        if not isinstance(principal, dict) or not any(
-            "token.actions.githubusercontent.com" in str(provider)
-            for provider in as_list(principal.get("Federated", []))
-        ):
-            continue
-        condition = statement.get("Condition", {})
-        if not isinstance(condition, dict):
-            continue
-        subject = "token.actions.githubusercontent.com:sub"
-        subjects = [
-            (operator, value)
-            for operator, clauses in condition.items() if isinstance(clauses, dict)
-            for value in as_list(clauses.get(subject, []))
-        ]
-        if not subjects or any(
-            operator == "StringLike" and any(mark in str(value) for mark in "*?")
-            for operator, value in subjects
-        ):
-            line = next((i for i, row in enumerate(text.splitlines(), 1)
-                         if subject in row), 1)
-            results.add(Finding(path.relative_to(root).as_posix(), line,
-                                "oidc-wildcard", "high",
-                                "Constrain GitHub OIDC subject to an explicit trust boundary."))
-    return sorted(results)
 
-def as_list(value):
+WorkflowLoader.yaml_implicit_resolvers = {
+    key: [(tag, regex) for tag, regex in values if tag != "tag:yaml.org,2002:bool"]
+    for key, values in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.I), list("tTfF")
+)
+
+
+def _load(path):
+    class MarkedDict(dict):
+        pass
+
+    class Loader(WorkflowLoader):
+        def construct_mapping(self, node, deep=False):
+            self.flatten_mapping(node)
+            result = MarkedDict(super().construct_mapping(node, deep=deep))
+            result.marks = {
+                self.construct_object(key): (value.start_mark.line + 1, value.start_mark.column + 1)
+                for key, value in node.value
+            }
+            return result
+
+    def mapping(loader, node):
+        data = MarkedDict()
+        yield data
+        constructed = loader.construct_mapping(node)
+        data.update(constructed)
+        data.marks = constructed.marks
+
+    Loader.add_constructor("tag:yaml.org,2002:map", mapping)
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=Loader)
+
+
+def _map(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _items(value):
     return value if isinstance(value, list) else [value]
 
 
-def scan(root: Path, trust_policies=()):
+SHA = re.compile(r"[0-9a-f]{40}", re.I)
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRET = re.compile(r"\$\{\{\s*secrets\b", re.I)
+PR_HEAD = re.compile(
+    r"\bgithub\.event\.pull_request\.head\b|\bgithub\.head_ref\b",
+    re.I,
+)
+EVENT_DATA = re.compile(
+    r"\bgithub\.(?:event|head_ref|ref_name)\b", re.I
+)
+EVENT_TRUSTED = re.compile(
+    r"\bgithub\.event\.(?:number|pull_request\.(?:number|id|merged|head\.sha|base\.sha))"
+    r"(?![\w.\[])",
+    re.I,
+)
+EXPRESSION_TOKEN = re.compile(r"\[\s*'([\w-]+)'\s*\]|'(?:[^']|'')*'")
+
+
+def _expression_code(expression):
+    return EXPRESSION_TOKEN.sub(
+        lambda token: "." + token[1] if token[1] is not None else "''", expression
+    )
+
+
+def _untrusted(script):
+    return any(
+        EVENT_DATA.search(EVENT_TRUSTED.sub("", _expression_code(expression)))
+        for expression in EXPRESSION.findall(script)
+    )
+
+
+def _pr_head(value):
+    if not isinstance(value, str):
+        return False
+    return bool(re.fullmatch(r"refs/pull/.+/head", value)) or any(
+        PR_HEAD.search(_expression_code(expr)) for expr in EXPRESSION.findall(value)
+    )
+
+
+def _external_uses(value):
+    if not isinstance(value, str) or value.startswith("./"):
+        return False
+    if value.startswith("docker://"):
+        return not bool(re.search(r"@sha256:[0-9a-f]{64}$", value, re.I))
+    name, _, ref = value.partition("@")
+    return "/" in name and not SHA.fullmatch(ref)
+
+
+def _github(doc, emit):
+    triggers = doc.get("on", [])
+    triggers = set(triggers) if isinstance(triggers, dict) else {
+        item for item in _items(triggers) if isinstance(item, str)
+    }
+    privileged = triggers & {"pull_request_target", "workflow_run"}
+    root_permissions = doc.get("permissions")
+    if root_permissions == "write-all":
+        emit("AH004", doc, "permissions")
+    if _map(root_permissions).get("id-token") == "write" or root_permissions == "write-all":
+        emit("AH009", doc, "permissions")
+
+    for definition in _map(doc.get("jobs")).values():
+        job = _map(definition)
+        permissions = job.get("permissions", root_permissions)
+        if job.get("permissions") == "write-all":
+            emit("AH004", job, "permissions")
+        if ("permissions" in job and not job.get("environment") and
+                (_map(permissions).get("id-token") == "write" or permissions == "write-all")):
+            emit("AH009", job, "permissions")
+
+        unsafe_checkout = False
+        for step_definition in [job, *_items(job.get("steps"))]:
+            step = _map(step_definition)
+            uses = step.get("uses", "")
+            inputs = _map(step.get("with"))
+            has_secrets = (
+                bool(SECRET.search(str((inputs, step.get("env"), job.get("env"), doc.get("env"),
+                                        step.get("run")))))
+                or bool(step.get("secrets"))
+            )
+            if unsafe_checkout and has_secrets:
+                emit("AH013", step, "uses" if "uses" in step else "run")
+            if _external_uses(uses):
+                emit("AH003", step, "uses")
+                if has_secrets:
+                    emit("AH005", step, "uses")
+            if isinstance(step.get("run"), str) and _untrusted(step["run"]):
+                emit("AH002", step, "run")
+            if not isinstance(uses, str):
+                continue
+            action = uses.partition("@")[0].lower()
+            if ("pull_request_target" in triggers and action == "actions/checkout" and
+                    any(_pr_head(inputs.get(key)) for key in ("ref", "repository"))):
+                marker = "ref" if _pr_head(inputs.get("ref")) else "repository"
+                emit("AH001", inputs, marker)
+                unsafe_checkout = True
+            if (privileged or inputs.get("restore-keys")) and (
+                action in {"actions/cache", "actions/cache/restore", "actions/cache/save"}
+                or (action == "actions/setup-node" and inputs.get("cache"))
+            ):
+                emit("AH006", step, "uses")
+            if action == "actions/download-artifact" and (
+                privileged or "run-id" in inputs or "repository" in inputs
+            ):
+                emit("AH007", step, "uses")
+            if "workflow_run" in triggers and action == "dawidd6/action-download-artifact":
+                emit("AH007", step, "uses")
+
+
+def _gitlab(doc, emit):
+    for include_definition in _items(doc.get("include")):
+        include = _map(include_definition)
+        if (("project" in include and not SHA.fullmatch(str(include.get("ref", ""))))
+                or ("remote" in include and not re.fullmatch(
+                    r"sha256-[A-Za-z0-9+/]{43}=", str(include.get("integrity", ""))
+                ))):
+            emit("AH010", include, "project" if "project" in include else "remote")
+        elif isinstance(include_definition, str) and include_definition.startswith(("https://", "http://")):
+            emit("AH010", doc, "include")
+
+    default = _map(doc.get("default"))
+    for name, definition in doc.items():
+        if name in {"default", "workflow", "variables", "include", "cache", "stages",
+                    "image", "services", "before_script", "after_script", "spec"}:
+            continue
+        if str(name).startswith("."):
+            continue
+        job = _map(definition)
+        if not job:
+            continue
+        selectors = str([job.get("rules"), job.get("only"), _map(doc.get("workflow")).get("rules")])
+        merge_request = bool(re.search(r"merge_requests?|CI_MERGE_REQUEST_", selectors))
+        for owner in (job, default, doc):
+            if "cache" not in owner:
+                continue
+            for entry in _items(owner["cache"]):
+                cache = _map(entry)
+                if not cache or cache.get("policy") == "pull":
+                    continue
+                if merge_request and (cache.get("unprotect") is True or cache.get("fallback_keys")):
+                    emit("AH006", owner, "cache")
+                elif str(cache.get("key", "")) in {"default", "$CI_PROJECT_NAME"}:
+                    emit("AH012", owner, "cache")
+            break
+        for key in ("before_script", "script", "after_script"):
+            owner = job if key in job else default if key in default else doc
+            for script in _items(owner.get(key)):
+                if isinstance(script, str) and re.search(
+                    r"""\b(?:eval|(?:ba)?sh\s+-c)\s+["']?\$(?:\{)?CI_MERGE_REQUEST_""", script
+                ):
+                    emit("AH011", owner, key)
+        for need in _items(job.get("needs")):
+            need = _map(need)
+            if "project" in need and need.get("artifacts") is True:
+                emit("AH007", need, "project")
+
+
+OIDC_KEYS = {"sub", "subject", "subjects", "sub-pattern", "subject-pattern",
+             "oidc-subject", "oidc-subject-pattern", "token.actions.githubusercontent.com:sub"}
+
+
+def _oidc(doc, emit, seen):
+    if isinstance(doc, (dict, list)):
+        if id(doc) in seen:
+            return
+        seen.add(id(doc))
+    if isinstance(doc, list):
+        for value in doc:
+            _oidc(value, emit, seen)
+    elif isinstance(doc, dict):
+        for key, value in doc.items():
+            if str(key).lower().replace("_", "-") in OIDC_KEYS:
+                if any(isinstance(item, str) and ("*" in item or "?" in item)
+                       for item in _items(value)):
+                    emit("AH008", doc, key)
+            _oidc(value, emit, seen)
+
+
+OIDC_SUBJECT = "token.actions.githubusercontent.com:sub"
+
+
+def scan_oidc(path: Path, root: Path) -> list[Finding]:
+    """Review explicit AWS IAM trust policies for GitHub federation."""
+    relative = path.relative_to(root).as_posix()
+    try:
+        source = path.read_text(encoding="utf-8")
+        policy = json.loads(source)
+    except (UnicodeError, OSError, json.JSONDecodeError) as exc:
+        raise ScanError(f"{relative}: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise ScanError(f"{relative}: expected a JSON object")
+    findings = set()
+    for item in _items(policy.get("Statement")):
+        statement = _map(item)
+        if statement.get("Effect") != "Allow" or not any(
+            isinstance(provider, str) and provider.endswith("token.actions.githubusercontent.com")
+            for provider in _items(_map(statement.get("Principal")).get("Federated"))
+        ):
+            continue
+        conditions = _map(statement.get("Condition"))
+        subjects = [
+            (operator, subject)
+            for operator, clauses in conditions.items()
+            if OIDC_SUBJECT in _map(clauses)
+            for subject in _items(clauses[OIDC_SUBJECT])
+        ]
+        if not subjects or any(
+            isinstance(subject, str) and ("*" in subject or "?" in subject)
+            for operator, subject in subjects if operator.split(":")[-1].startswith("StringLike")
+        ):
+            marker = OIDC_SUBJECT if subjects else "Federated"
+            line, column = next(
+                ((number, text.index(marker) + 1) for number, text in enumerate(source.splitlines(), 1)
+                 if marker in text),
+                (1, 1),
+            )
+            findings.add(Finding(relative, line, column, "AH008"))
+    return sorted(findings)
+
+
+def scan(root: Path | str, trust_policies=()) -> list[Finding]:
+    """Return deterministic, path-relative findings or raise ScanError."""
+    root = Path(root)
+    if not root.is_dir():
+        raise ScanError(f"Not a directory: {root}")
     workflows = root / ".github" / "workflows"
-    paths = [*workflows.glob("*.yml"), *workflows.glob("*.yaml")]
     gitlab = root / ".gitlab-ci.yml"
-    if gitlab.is_file():
-        paths.append(gitlab)
-    findings = [finding for path in sorted(paths) for finding in scan_file(path, root)]
-    for path in trust_policies:
-        findings.extend(scan_oidc(root / path, root))
+    candidates = [*workflows.glob("*.yml"), *workflows.glob("*.yaml"), gitlab]
+    findings = set()
+    for path in sorted(candidates):
+        if not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+            continue
+        relative = path.relative_to(root).as_posix()
+        try:
+            doc = _load(path)
+        except (UnicodeError, OSError, yaml.YAMLError, RecursionError) as exc:
+            raise ScanError(f"{relative}: {exc}") from exc
+        if doc is None:
+            continue
+        if not isinstance(doc, dict):
+            raise ScanError(f"{relative}: expected a YAML mapping")
+
+        def emit(rule, owner, key):
+            line, column = getattr(owner, "marks", {}).get(key, (1, 1))
+            findings.add(Finding(relative, line, column, rule))
+
+        (_gitlab if path == gitlab else _github)(doc, emit)
+        _oidc(doc, emit, set())
+    for policy in trust_policies:
+        path = (root / policy).resolve()
+        if not path.is_relative_to(root.resolve()):
+            raise ScanError(f"Trust policy is outside the scan root: {policy}")
+        findings.update(scan_oidc(path, root.resolve()))
     return sorted(findings)
