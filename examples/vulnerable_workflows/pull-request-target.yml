@@ -1,0 +1,18 @@
+# Static analysis fixture. Keep outside .github/workflows.
+name: Pull request trust boundary
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  review:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: example-cache

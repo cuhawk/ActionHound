@@ -1,0 +1,99 @@
+rules:
+  - id: actionhound-js-oauth-redirect
+    message: Resolve the OAuth redirect URI from an exact registered URI allowlist.
+    severity: ERROR
+    languages: [javascript, typescript]
+    mode: taint
+    metadata: {cwe: "CWE-601", technology: [express, oauth2]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query.redirect_uri
+          - pattern: $REQ.body.redirect_uri
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $RES.redirect($URL)
+              - pattern: $RES.redirect($STATUS, $URL)
+          - focus-metavariable: $URL
+
+  - id: actionhound-js-oauth-state
+    message: Enable Passport OAuth2 state verification with a session-backed state store.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: {cwe: "CWE-352", technology: [passport, oauth2]}
+    patterns:
+      - pattern-either:
+          - pattern: >-
+              new OAuth2Strategy({authorizationURL: $AUTH, tokenURL: $TOKEN, ...}, ...)
+          - pattern: >-
+              new $PASSPORT.OAuth2Strategy({authorizationURL: $AUTH, tokenURL: $TOKEN, ...}, ...)
+      - pattern-not: >-
+          new $STRATEGY({state: true, ...}, ...)
+      - pattern-not: >-
+          new $PASSPORT.OAuth2Strategy({state: true, ...}, ...)
+      - pattern-not: >-
+          new $STRATEGY({store: $STORE, ...}, ...)
+      - pattern-not: >-
+          new $PASSPORT.OAuth2Strategy({store: $STORE, ...}, ...)
+
+  - id: actionhound-js-jwt-weak-validation
+    message: Verify the JWT signature and explicitly allowlist trusted algorithms.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata: {cwe: "CWE-347", technology: [jsonwebtoken]}
+    patterns:
+      - pattern-either:
+          - pattern: >-
+              jwt.verify($TOKEN, $KEY, {algorithms: [..., "none", ...], ...}, ...)
+          - pattern: >-
+              jsonwebtoken.verify($TOKEN, $KEY, {algorithms: [..., "none", ...], ...}, ...)
+
+  - id: actionhound-js-unscoped-object-lookup
+    message: Scope the lookup to the authenticated tenant or enforce object authorization before use.
+    severity: WARNING
+    languages: [javascript, typescript]
+    mode: taint
+    metadata: {cwe: "CWE-639", technology: [express, mongoose]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.params.$KEY
+          - pattern: $REQ.query.$KEY
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern: $MODEL.findById($ID, ...)
+          - focus-metavariable: $ID
+
+  - id: actionhound-js-ssrf
+    message: Resolve outbound destinations against an allowlist and enforce the policy on redirects.
+    severity: ERROR
+    languages: [javascript, typescript]
+    mode: taint
+    metadata: {cwe: "CWE-918", technology: [express, axios, fetch]}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query.$KEY
+          - pattern: $REQ.body.$KEY
+          - pattern: $REQ.params.$KEY
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: axios.get($URL, ...)
+              - pattern: axios.post($URL, ...)
+          - focus-metavariable: $URL
+
+  - id: static-oauth-state
+    message: Bind a fresh OAuth state value to the initiating session and verify it on callback.
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata: {cwe: "CWE-352", technology: [oauth2]}
+    patterns:
+      - pattern: >-
+          new URLSearchParams({..., state: $STATE, ...})
+      - metavariable-regex:
+          metavariable: $STATE
+          regex: '^["'']'

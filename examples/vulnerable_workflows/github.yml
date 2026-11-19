@@ -1,0 +1,10 @@
+# Static analysis fixture. Keep outside .github/workflows.
+name: Workflow policy findings
+on: workflow_dispatch
+permissions: write-all
+jobs:
+  review:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
