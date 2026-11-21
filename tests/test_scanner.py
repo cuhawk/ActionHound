@@ -23,7 +23,7 @@ def workflow(root, step, *, event="pull_request", extra=""):
     ("A" * 40, False), ("a" * 39, True), ("g" * 40, True),
 ])
 def test_action_pins(tmp_path, ref, expected):
-    workflow(tmp_path, f"- uses: actions/checkout@{ref}")
+    workflow(tmp_path, f"- uses: actions/checkout@{ref}\n  with: {{persist-credentials: false}}")
     assert bool(scan(tmp_path)) == expected
 
 
@@ -64,6 +64,7 @@ def test_inline_data(tmp_path, script, expected):
 def test_checkout_boundary(tmp_path, event, expected):
     workflow(tmp_path, f"""- uses: actions/checkout@{'a'*40}
   with:
+    persist-credentials: false
     ref: ${{{{ github.event.pull_request.head.sha }}}}""", event=event)
     assert {f.rule_id for f in scan(tmp_path)} == expected
 
@@ -71,6 +72,7 @@ def test_checkout_boundary(tmp_path, event, expected):
 def test_trusted_checkout(tmp_path):
     workflow(tmp_path, f"""- uses: actions/checkout@{'a'*40}
   with:
+    persist-credentials: false
     ref: ${{{{ github.event.pull_request.base.sha }}}}""", event="pull_request_target")
     assert scan(tmp_path) == []
 
@@ -94,7 +96,7 @@ def test_permissions_and_secret(tmp_path):
     workflow(tmp_path, """- uses: example/report@main
   env:
     TOKEN: ${{ secrets.REPORT_TOKEN }}""", extra="permissions: write-all\n")
-    assert {f.rule_id for f in scan(tmp_path)} == {"AH003", "AH004", "AH005", "AH009"}
+    assert {f.rule_id for f in scan(tmp_path)} == {"AH004", "AH005", "AH014", "AH015"}
 
 
 def test_job_permissions(tmp_path):
@@ -110,9 +112,9 @@ def test_job_permissions(tmp_path):
             permissions:
               id-token: write
     """)
-    finding, = scan(tmp_path)
+    finding, = scan(tmp_path, protected_environments=["production"])
     assert (finding.rule_id, finding.path, finding.line) == (
-        "AH009", ".github/workflows/check.yaml", 9
+        "AH015", ".github/workflows/check.yaml", 9
     )
 
 
@@ -138,7 +140,7 @@ def test_gitlab_include_and_artifact(tmp_path):
               ref: main
               artifacts: true
     """)
-    assert [(f.rule_id, f.line) for f in scan(tmp_path)] == [("AH010", 2), ("AH007", 7)]
+    assert [(f.rule_id, f.line) for f in scan(tmp_path)] == [("AH016", 2), ("AH007", 7)]
 
 
 @pytest.mark.parametrize(("policy", "expected"), [("pull-push", {"AH006"}), ("pull", set())])
@@ -177,7 +179,7 @@ def test_reject_symlink_outside_root(tmp_path):
 
 
 @pytest.mark.parametrize(("fixture", "target", "expected"), [
-    ("github.yml", ".github/workflows/fixture.yml", {"AH003", "AH004", "AH009"}),
+    ("github.yml", ".github/workflows/fixture.yml", {"AH003", "AH004", "AH013", "AH015"}),
     ("gitlab.yml", ".gitlab-ci.yml", {"AH007"}),
 ])
 def test_examples(tmp_path, fixture, target, expected):
@@ -212,9 +214,9 @@ def test_aws_oidc_policy(tmp_path, operator, subject, expected):
 
 def test_gitlab_shared_cache(tmp_path):
     write(tmp_path / ".gitlab-ci.yml", "test:\n  cache: {key: default}\n  script: echo ok")
-    assert {f.rule_id for f in scan(tmp_path)} == {"AH012"}
+    assert {f.rule_id for f in scan(tmp_path)} == {"AH018"}
 
 
 def test_privileged_artifact_download(tmp_path):
     workflow(tmp_path, "- uses: actions/download-artifact@" + "a" * 40, event="workflow_run")
-    assert {f.rule_id for f in scan(tmp_path)} == {"AH007"}
+    assert {f.rule_id for f in scan(tmp_path)} == {"AH011"}
