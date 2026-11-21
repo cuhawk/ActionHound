@@ -1,6 +1,7 @@
 """Build SARIF 2.1.0 and Markdown reports."""
 
 from collections.abc import Iterable
+from hashlib import sha256
 from urllib.parse import quote
 
 from . import __version__
@@ -35,6 +36,11 @@ def to_sarif(findings: Iterable[Finding]) -> dict:
                     "region": {"startLine": finding.line, "startColumn": finding.column},
                 },
             }],
+            "partialFingerprints": {
+                "primaryLocationLineHash/v1": sha256(
+                    finding.source_line.strip().encode("utf-8")
+                ).hexdigest(),
+            } if finding.source_line else {},
             "properties": {"severity": finding.rule.severity},
         }
         for finding in findings
